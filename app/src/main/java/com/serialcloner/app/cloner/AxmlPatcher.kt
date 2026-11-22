@@ -10,11 +10,11 @@ import java.nio.charset.StandardCharsets
  *
  * Updates:
  *  1. <manifest package="..."> -> newPackageName (e.g., com.example.app.clone1)
- *  2. <application android:label="..."> -> "AppName 1" (forces TYPE_STRING so home screen shows serial)
- *  3. Relative component class names (e.g., ".MainActivity") -> fully-qualified original class names
- *     so Android can still load classes from the original DEX after package rename.
- *  4. <provider android:authorities="..."> -> suffixed with ".cloneN" to avoid provider conflicts.
- *  5. Custom <permission> / <uses-permission> under oldPackageName -> remapped to newPackageName.
+ *  2. <application android:label="..."> -> "AppName 1"
+ *  3. <application android:isSplitRequired="false"> when present
+ *  4. Relative component class names (e.g., ".MainActivity") -> fully-qualified original class names
+ *  5. <provider android:authorities="..."> -> rewritten (including @string references) to prevent conflicts
+ *  6. All <permission> definitions & matching <uses-permission> -> suffixed to prevent duplicate permission errors
  */
 object AxmlPatcher {
 
@@ -23,6 +23,7 @@ object AxmlPatcher {
     private const val RES_XML_START_ELEMENT_TYPE = 0x0102
 
     private const val UTF8_FLAG = 0x00000100
+    private const val TYPE_REFERENCE = 0x01
     private const val TYPE_STRING = 0x03
 
     private val COMPONENT_TAGS = setOf(
@@ -42,11 +43,10 @@ object AxmlPatcher {
         require(fileType == RES_XML_TYPE) { "Invalid AXML header: 0x${fileType.toString(16)}" }
         buf.int // original file size
 
-        // Parse StringPool chunk immediately after AXML header
         val poolStart = fileHeaderSize
         buf.position(poolStart)
         val poolType = buf.short.toInt() and 0xFFFF
-        val poolHeaderSize = buf.short.toInt() and 0xFFFF
+        buf.short // poolHeaderSize
         val poolChunkSize = buf.int
         require(poolType == RES_STRING_POOL_TYPE) { "Expected StringPool chunk at $poolStart" }
 
@@ -66,14 +66,11 @@ object AxmlPatcher {
         }
 
         val rawStylesData = if (styleCount > 0 && stylesStart > 0) {
-            val absStart = poolStart + stylesStart
-            val absEnd = poolStart + poolChunkSize
-            axmlBytes.copyOfRange(absStart, absEnd)
+            axmlBytes.copyOfRange(poolStart + stylesStart, poolStart + poolChunkSize)
         } else {
             ByteArray(0)
         }
 
-        // Copy all chunks after StringPool so we can patch element attributes in place
         val restStart = poolStart + poolChunkSize
         val restBytes = axmlBytes.copyOfRange(restStart, axmlBytes.size)
         val restBuf = ByteBuffer.wrap(restBytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -87,7 +84,50 @@ object AxmlPatcher {
 
         val newPkgIndex = getOrAddString(newPackage)
         val newLabelIndex = getOrAddString(newLabel)
+        val renamedPermissions = mutableMapOf<String, String>()
+        var providerCounter = 0
 
+        // First pass: collect all declared custom <permission> names so we can rename them consistently
+        var scanPos = 0
+        while (scanPos + 8 <= restBytes.size) {
+            val chunkType = restBuf.getShort(scanPos).toInt() and 0xFFFF
+            val chunkHeaderSize = restBuf.getShort(scanPos + 2).toInt() and 0xFFFF
+            val chunkSize = restBuf.getInt(scanPos + 4)
+            if (chunkSize <= 0 || scanPos + chunkSize > restBytes.size) break
+
+            if (chunkType == RES_XML_START_ELEMENT_TYPE) {
+                val elemBase = scanPos + chunkHeaderSize
+                val nameIdx = restBuf.getInt(elemBase + 4)
+                val attrStart = restBuf.getShort(elemBase + 8).toInt() and 0xFFFF
+                val attrSize = restBuf.getShort(elemBase + 10).toInt() and 0xFFFF
+                val attrCount = restBuf.getShort(elemBase + 12).toInt() and 0xFFFF
+                val tagName = strings.getOrNull(nameIdx) ?: ""
+
+                if (tagName == "permission") {
+                    val attrsBase = elemBase + attrStart
+                    for (i in 0 until attrCount) {
+                        val attrPos = attrsBase + i * attrSize
+                        val attrName = strings.getOrNull(restBuf.getInt(attrPos + 4)) ?: ""
+                        val valueType = restBuf.get(attrPos + 15).toInt() and 0xFF
+                        val valueData = restBuf.getInt(attrPos + 16)
+                        if (attrName == "name" && valueType == TYPE_STRING) {
+                            val permName = strings.getOrNull(valueData)
+                            if (!permName.isNullOrEmpty() && !permName.startsWith("android.permission.")) {
+                                val newPerm = if (permName.startsWith(oldPackage)) {
+                                    permName.replaceFirst(oldPackage, newPackage)
+                                } else {
+                                    "$permName.clone$serialNumber"
+                                }
+                                renamedPermissions[permName] = newPerm
+                            }
+                        }
+                    }
+                }
+            }
+            scanPos += chunkSize
+        }
+
+        // Second pass: patch attributes
         var pos = 0
         while (pos + 8 <= restBytes.size) {
             val chunkType = restBuf.getShort(pos).toInt() and 0xFFFF
@@ -129,7 +169,12 @@ object AxmlPatcher {
                             setStringAttr(newLabelIndex)
                         }
 
-                        // 3. Expand relative component class names so DEX classes still resolve
+                        // 3. Disable isSplitRequired flag if present
+                        tagName == "application" && attrName == "isSplitRequired" -> {
+                            restBuf.putInt(attrPos + 16, 0)
+                        }
+
+                        // 4. Expand relative component class names so DEX classes still resolve
                         tagName in COMPONENT_TAGS && attrName == "name" && valueType == TYPE_STRING -> {
                             val current = strings.getOrNull(valueData) ?: strings.getOrNull(rawValIdx)
                             if (!current.isNullOrEmpty()) {
@@ -144,28 +189,39 @@ object AxmlPatcher {
                             }
                         }
 
-                        // 4. Rewrite ContentProvider authorities to avoid INSTALL_FAILED_CONFLICTING_PROVIDER
-                        tagName == "provider" && attrName == "authorities" && valueType == TYPE_STRING -> {
-                            val current = strings.getOrNull(valueData) ?: strings.getOrNull(rawValIdx)
-                            if (!current.isNullOrEmpty()) {
-                                val updated = current.split(";").joinToString(";") { auth ->
-                                    if (auth.startsWith(oldPackage)) {
-                                        auth.replaceFirst(oldPackage, newPackage)
-                                    } else {
-                                        "$auth.clone$serialNumber"
+                        // 5. Rewrite ContentProvider authorities (string OR @string reference)
+                        tagName == "provider" && attrName == "authorities" -> {
+                            if (valueType == TYPE_STRING) {
+                                val current = strings.getOrNull(valueData) ?: strings.getOrNull(rawValIdx)
+                                if (!current.isNullOrEmpty()) {
+                                    val updated = current.split(";").joinToString(";") { auth ->
+                                        if (auth.startsWith(oldPackage)) {
+                                            auth.replaceFirst(oldPackage, newPackage)
+                                        } else {
+                                            "$auth.clone$serialNumber"
+                                        }
                                     }
+                                    setStringAttr(getOrAddString(updated))
                                 }
-                                setStringAttr(getOrAddString(updated))
+                            } else if (valueType == TYPE_REFERENCE) {
+                                providerCounter++
+                                setStringAttr(getOrAddString("$newPackage.cloneprovider$providerCounter"))
                             }
                         }
 
-                        // 5. Remap custom app-owned permissions
-                        (tagName == "permission" || tagName == "uses-permission") &&
-                            attrName == "name" && valueType == TYPE_STRING -> {
-                            val current = strings.getOrNull(valueData) ?: strings.getOrNull(rawValIdx)
-                            if (current != null && current.startsWith("$oldPackage.")) {
-                                val updated = current.replaceFirst(oldPackage, newPackage)
-                                setStringAttr(getOrAddString(updated))
+                        // 6. Remap custom permissions across <permission>, <uses-permission>, and component permission attrs
+                        (attrName == "name" && (tagName == "permission" || tagName == "uses-permission")) ||
+                            (attrName == "permission" && tagName in COMPONENT_TAGS) -> {
+                            if (valueType == TYPE_STRING) {
+                                val current = strings.getOrNull(valueData) ?: strings.getOrNull(rawValIdx)
+                                val mapped = if (current != null) {
+                                    renamedPermissions[current] ?: if (current.startsWith("$oldPackage.")) {
+                                        current.replaceFirst(oldPackage, newPackage)
+                                    } else null
+                                } else null
+                                if (mapped != null) {
+                                    setStringAttr(getOrAddString(mapped))
+                                }
                             }
                         }
                     }
@@ -175,10 +231,7 @@ object AxmlPatcher {
             pos += chunkSize
         }
 
-        // Rebuild StringPool cleanly in UTF-16LE
         val rebuiltPool = buildUtf16StringPool(strings, styleOffsets, rawStylesData)
-
-        // Assemble final AXML binary
         val totalSize = fileHeaderSize + rebuiltPool.size + restBytes.size
         val out = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
         out.putShort(RES_XML_TYPE.toShort())
@@ -218,12 +271,10 @@ object AxmlPatcher {
             }
             val utf16 = s.toByteArray(StandardCharsets.UTF_16LE)
             stringDataOut.write(utf16)
-            // Null terminator (UTF-16)
             stringDataOut.write(0)
             stringDataOut.write(0)
         }
 
-        // Pad string data to 4-byte boundary
         while (stringDataOut.size() % 4 != 0) {
             stringDataOut.write(0)
         }
@@ -244,7 +295,7 @@ object AxmlPatcher {
         out.putInt(chunkSize)
         out.putInt(stringCount)
         out.putInt(styleCount)
-        out.putInt(0) // flags = 0 (UTF-16LE, unsorted)
+        out.putInt(0)
         out.putInt(stringsStart)
         out.putInt(stylesStart)
 
@@ -259,10 +310,8 @@ object AxmlPatcher {
 
     private fun readUtf8String(data: ByteArray, startOffset: Int): String {
         var pos = startOffset
-        // UTF-16 length (1 or 2 bytes)
         val u16Len = data[pos++].toInt() and 0xFF
         if ((u16Len and 0x80) != 0) pos++
-        // UTF-8 byte length (1 or 2 bytes)
         var byteLen = data[pos++].toInt() and 0xFF
         if ((byteLen and 0x80) != 0) {
             byteLen = ((byteLen and 0x7F) shl 8) or (data[pos++].toInt() and 0xFF)

@@ -5,6 +5,8 @@ import com.android.apksig.ApkSigner
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FilterOutputStream
+import java.io.OutputStream
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -12,7 +14,8 @@ import java.util.zip.ZipOutputStream
 
 /**
  * Repackages an installed APK with a new serial package name (e.g., pkg.clone1),
- * updated home-screen label (e.g., "App 1"), and fresh v1+v2+v3 APK signatures.
+ * updated home-screen label (e.g., "App 1"), proper 4-byte / 4KB ZIP alignment
+ * required by Android 11+, and fresh v1+v2+v3 APK signatures.
  */
 object ApkClonerEngine {
 
@@ -21,6 +24,21 @@ object ApkClonerEngine {
         val clonedPackageName: String,
         val clonedLabel: String
     )
+
+    private class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
+        var count: Long = 0L
+            private set
+
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
+        }
+    }
 
     fun cloneApk(
         context: Context,
@@ -42,7 +60,8 @@ object ApkClonerEngine {
 
         onProgress("Reading original APK & patching manifest...")
         ZipFile(File(sourceApkPath)).use { zipIn ->
-            ZipOutputStream(BufferedOutputStream(FileOutputStream(unsignedApk))).use { zipOut ->
+            val countingOut = CountingOutputStream(BufferedOutputStream(FileOutputStream(unsignedApk)))
+            ZipOutputStream(countingOut).use { zipOut ->
                 val entries = zipIn.entries()
                 while (entries.hasMoreElements()) {
                     val entry = entries.nextElement()
@@ -67,14 +86,26 @@ object ApkClonerEngine {
                         zipOut.write(patchedManifest)
                         zipOut.closeEntry()
                     } else if (entry.method == ZipEntry.STORED || name == "resources.arsc" || name.endsWith(".so")) {
-                        // Keep resources.arsc and native .so uncompressed (required by Android 11+)
+                        // Android 11+ requires resources.arsc uncompressed & 4-byte aligned,
+                        // and native .so libraries uncompressed & 4096-byte page aligned.
                         val data = zipIn.getInputStream(entry).use { it.readBytes() }
                         val crc = CRC32().apply { update(data) }.value
+
+                        zipOut.flush()
+                        val alignment = if (name.endsWith(".so")) 4096 else 4
+                        val nameBytesLen = name.toByteArray(Charsets.UTF_8).size
+                        val dataOffset = countingOut.count + 30L + nameBytesLen
+                        val rem = (dataOffset % alignment).toInt()
+                        val pad = if (rem == 0) 0 else (alignment - rem)
+
                         val newEntry = ZipEntry(name).apply {
                             method = ZipEntry.STORED
                             size = data.size.toLong()
                             compressedSize = data.size.toLong()
                             this.crc = crc
+                            if (pad > 0) {
+                                extra = ByteArray(pad)
+                            }
                         }
                         zipOut.putNextEntry(newEntry)
                         zipOut.write(data)
